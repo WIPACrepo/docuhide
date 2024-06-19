@@ -192,6 +192,7 @@ def main():
         if id_.startswith('Collection'):
             title = collections[id_]['title']
         else:
+            continue
             title = documents[id_]['title']
         print(' '*level, id_, title)
 
