@@ -1,3 +1,5 @@
+from __future__ import print_function
+
 import argparse
 import os
 import re
@@ -5,7 +7,24 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
+from ldap3 import Connection, ALL
+
+
 escape_illegal_xml_characters = lambda x: re.sub(u'[\x00-\x08\x0b\x0c\x0e-\x1F\uD800-\uDFFF\uFFFE\uFFFF]', '', x)
+
+
+UID_CACHE = {}
+def get_uid(username):
+    if username in ('root', 'icecube'):
+        return 0
+    if not UID_CACHE:
+        conn = Connection('ldap-1.icecube.wisc.edu', auto_bind=True)
+        entries = conn.extend.standard.paged_search('ou=People,dc=icecube,dc=wisc,dc=edu', '(objectclass=posixAccount)', attributes=['uid', 'uidNumber'], paged_size=100)
+        for entry in entries:
+            attrs = entry['attributes']
+            UID_CACHE[attrs['uid'][0]] = attrs['uidNumber']
+
+    return UID_CACHE[username]
 
 
 def get_documents(data):
@@ -37,7 +56,7 @@ def get_documents(data):
             
         if type_ == 'Document':
             props = child.find('props')
-            if not props:
+            if props is None or len(props) == 0:
                 title = id_
             else:
                 for prop in props:
@@ -109,7 +128,7 @@ def get_documents(data):
             title = ''
             sort_order = 'Title'
             props = child.find('props')
-            if not props:
+            if props is None or len(props) == 0:
                 title = id_
             else:
                 for prop in props:
@@ -131,7 +150,7 @@ def get_documents(data):
             title = ''
             url = ''
             props = child.find('props')
-            if not props:
+            if props is None or len(props) == 0:
                 title = id_
             else:
                 for prop in props:
@@ -184,7 +203,7 @@ def get_documents(data):
 
 class TreeNode(list):
     def __init__(self):
-        super().__init__()
+        super(TreeNode, self).__init__()
         self.parent = None
 
 
@@ -200,14 +219,15 @@ class Tree:
         else:
             node = self.nodes[id_] = TreeNode()
 
-        if parent:
+        if parent is not None:
             node.parent = parent
-            self.nodes[parent].append(id_)
+            if id_ not in self.nodes[parent]:
+                self.nodes[parent].append(id_)
             self.roots.discard(id_)
-        elif not node.parent:
+        elif node.parent is None:
             self.roots.add(id_)
 
-        if children:
+        if children is not None:
             self.add_children(id_, children)
 
     def add_children(self, id_, children):
@@ -284,7 +304,8 @@ def walk_tree(tree, id_=None, level=0):
 
     if id_ is None:
         for r in tree.roots:
-            yield from walk_tree(tree, r, level=0)
+            for ret in walk_tree(tree, r, level=0):
+                yield ret
     else:
         yield id_, level
         for d in tree.nodes[id_]:
@@ -293,7 +314,8 @@ def walk_tree(tree, id_=None, level=0):
             else:
                 doc = {'type': 'Document'}
             if doc['type'] == 'Collection':
-                yield from walk_tree(tree, id_=d, level=level+1)
+                for ret in walk_tree(tree, id_=d, level=level+1):
+                    yield ret
             else:
                 yield d, level+1
 
@@ -328,7 +350,7 @@ def main():
 
     # print tree
     skip = False
-    for id_, level in walk_tree(tree):
+    for id_, level in walk_tree(tree, id_='Collection-9550'):
         if skip and level > 0:
             continue
         try:
@@ -348,7 +370,8 @@ def main():
             continue
         skip = False
         user = documents.get(owner,{}).get('username','root')
-        print('|'+' '*level + id_, title, user, private)
+        uid = get_uid(user)
+        print('|'+' '*level + id_, title, user, uid, private)
 
     return
 
