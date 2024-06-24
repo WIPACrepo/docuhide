@@ -1,6 +1,7 @@
-from __future__ import print_function, unicode_literals
+from __future__ import print_function, unicode_literals, division
 
 import argparse
+from datetime import datetime
 import json
 import os
 import re
@@ -42,7 +43,12 @@ else:
         json.dump(UID_CACHE, f)
 
 
-def get_documents(data):
+def total_seconds(timedelta):
+    # because python 2.6 is super old, we do this directly instead of .total_seconds()
+    return int(timedelta.seconds + timedelta.days * 24 * 3600)
+
+
+def get_documents(data, details=False):
     """Parse Docushare XML"""
     root = ET.fromstring(data)
 
@@ -79,78 +85,83 @@ def get_documents(data):
                         break
             
         if type_ == 'Document':
-            props = child.find('props')
-            if props is None or len(props) == 0:
+            if not details:
+                documents[id_] = {
+                    'type': 'Document',
+                    'owner': owner,
+                }
+            else:
+                props = child.find('props')
                 title = id_
-            else:
-                for prop in props:
-                    if prop.attrib['name'] == 'title':
-                        title = prop.text
-                        break
-                else:
-                    print(ET.tostring(child).decode('utf8'))
-                    raise Exception('no title in document')
-
-            versions = child.find('versions')
-            if versions is None:
-                print(ET.tostring(child).decode('utf8'))
-                raise Exception('no versions')
-            elif len(versions) == 1:
-                version_object = versions.findall('dsobject')[0]
-            else:
-                for obj in child.findall('./destinationlinks/preferredVersion'):
-                    # we have a preferred version, so use it
-                    handle = obj.text
-                    #print("preferred version handle", handle)
-                    for v in versions.findall('dsobject'):
-                        if v.attrib['handle'] == handle:
-                            version_object = v
+                if props is not None and len(props) > 0:
+                    for prop in props:
+                        if prop.attrib['name'] == 'title':
+                            title = prop.text
                             break
-                    else:
-                        raise Exception('no matching version')
-                    break
-                else:
-                    print(ET.tostring(child))
-                    raise Exception('no preferredVersion')
 
-            renditions = version_object.findall('./renditions/dsobject')
-            if len(renditions) == 0:
-                print(ET.tostring(child))
-                raise Exception('no rendition')
-            elif len(renditions) > 1:
-                print(ET.tostring(child))
-                raise Exception('too many renditions')
-            for r in renditions:
-                for prop in r.find('props'):
-                    if prop.attrib['name'] == 'size':
-                        size = prop.text
+                versions = child.find('versions')
+                if versions is None:
+                    print(ET.tostring(child).decode('utf8'))
+                    raise Exception('no versions')
+                elif len(versions) == 1:
+                    version_object = versions.findall('dsobject')[0]
+                else:
+                    for obj in child.findall('./destinationlinks/preferredVersion'):
+                        # we have a preferred version, so use it
+                        handle = obj.text
+                        #print("preferred version handle", handle)
+                        for v in versions.findall('dsobject'):
+                            if v.attrib['handle'] == handle:
+                                version_object = v
+                                break
+                        else:
+                            raise Exception('no matching version')
                         break
+                    else:
+                        print(ET.tostring(child))
+                        raise Exception('no preferredVersion')
+
+                renditions = version_object.findall('./renditions/dsobject')
+                if len(renditions) == 0:
+                    print(ET.tostring(child))
+                    raise Exception('no rendition')
+                elif len(renditions) > 1:
+                    print(ET.tostring(child))
+                    raise Exception('too many renditions')
+                size = -1
+                date = None
+                for r in renditions:
+                    for prop in r.find('props'):
+                        if prop.attrib['name'] == 'size':
+                            size = prop.text
+                        if prop.attrib['name'] == 'create_date':
+                            date = total_seconds(datetime.strptime(prop.text, '%a %b %d %H:%M:%S %Z %Y') - datetime.fromtimestamp(0))
+                    for o in r.findall('./contentelements/contentelement'):
+                        filename = o.attrib['filename']
+                        if title == id_:
+                            title = o.text
+                        break
+                    else:
+                        filename = None
+                    break
                 else:
                     size = -1
-                for o in r.findall('./contentelements/contentelement'):
-                    filename = o.attrib['filename']
-                    if title == id_:
-                        title = o.text
-                    break
-                else:
                     filename = None
-                break
-            else:
-                size = -1
-                filename = None
 
-            documents[id_] = {
-                'type': 'Document',
-                'title': title,
-                'size': size,
-                'filename': filename,
-                'owner': owner,
-                'private': private,
-            }
+                documents[id_] = {
+                    'type': 'Document',
+                    'owner': owner,
+                    'title': title,
+                    'private': private,
+                    'size': size,
+                    'filename': filename,
+                    'date': date,
+                }
 
         elif type_ == 'Collection':
             title = ''
             sort_order = 'Title'
+            date = None
             props = child.find('props')
             if props is None or len(props) == 0:
                 title = id_
@@ -160,11 +171,14 @@ def get_documents(data):
                         title = prop.text
                     if prop.attrib['name'] == 'sort_order':
                         sort_order = prop.text
+                    if prop.attrib['name'] == 'create_date':
+                        date = total_seconds(datetime.strptime(prop.text, '%a %b %d %H:%M:%S %Z %Y') - datetime.fromtimestamp(0))
 
             documents[id_] = {
                 'type': 'Collection',
                 'title': title,
                 'sort_order': sort_order,
+                'date': date,
                 'owner': owner,
                 'private': private,
                 'children': [e.text for e in child.findall('./destinationlinks/containment')],
@@ -189,8 +203,6 @@ def get_documents(data):
             documents[id_] = {
                 'type': 'URL',
                 'title': title,
-                'size': -1,
-                'filename': '',
                 'url': url,
                 'owner': owner,
                 'private': private,
@@ -353,7 +365,7 @@ def dsexport(arg, metadata=False):
     if metadata:
         cmd += '-r -m '
     cmd += arg
-    FNULL = open(os.devnull, 'w')
+    FNULL = open('/root/docuhide/export_err', 'w')
     subprocess.check_call(cmd, cwd='/root/docushare/bin', shell=True, stdout=FNULL, stderr=subprocess.STDOUT)
 
 
@@ -407,31 +419,22 @@ def main():
 
     # print tree
     print('Outputting tree and documents', file=sys.stderr, end='\n')
-    skip = False
     parent_paths = {}
     for id_, level in walk_tree(tree, id_=args.sub_collection, skip_level=args.max_depth):
         # print tree
-        if skip and level > 0:
-            continue
         try:
             doc = documents[id_]
         except KeyError:
             doc = {'type': 'Document', 'title': '', 'owner': '', 'private': False}
+
         if doc['type'] == 'Collection':
             title = doc['title']
             owner = doc['owner']
             private = doc['private']
         else:
-            title = doc['title']
             owner = doc['owner']
-            private = doc['private']
-        if level == 0 and title.startswith('Personal '):
-            skip = True
-            continue
-        skip = False
         user = documents.get(owner,{}).get('username','root')
         uid = UID_CACHE[user]
-        print('|'+' '*level + id_, title, user, uid, private)
 
         # make posix output
         if args.output:
@@ -459,16 +462,23 @@ def main():
                     perms = CHMOD_OWNER_DIR
                 else:
                     perms = CHMOD_ALL_DIR
+                if doc.get('date', None) is not None:
+                    try:
+                        os.utime(dest_path, (doc['date'], doc['date']))
+                    except Exception:
+                        print('cannot set time on', dest_path, file=sys.stderr)
             else:
                 # we need to get the actual document
                 path = os.path.join(DOCUHIDE_PATH, id_)
                 dsexport(id_)
                 with open(os.path.join(path, id_+'.xml'), 'r') as f:
                     input_xml = escape_illegal_xml_characters(f.read())
-                documents.update(get_documents(input_xml))
-                del input_xml
                 old_doc = doc
-                doc = documents[id_]
+                new_docs = get_documents(input_xml, details=True)
+                doc = new_docs[id_]
+                del input_xml
+                title = doc['title']
+                private = doc['private']
 
                 if doc['type'] == 'URL':
                     dest_path = os.path.join(dir_path, sanitize(doc['title']))
@@ -494,6 +504,12 @@ def main():
                     print('doc', doc, file=sys.stderr)
                     raise Exception('unknown doc type')
 
+                if doc.get('date', None) is not None:
+                    try:
+                        os.utime(dest_path, (doc['date'], doc['date']))
+                    except Exception:
+                        print('cannot set time on', dest_path, file=sys.stderr)
+
                 # clean up
                 shutil.rmtree(path)
 
@@ -505,6 +521,9 @@ def main():
             # set ownership and perms
             os.chown(dest_path, uid, uid)
             os.chmod(dest_path, perms)
+
+        # do this after output, to get a better doc title
+        print('|'+' '*level + id_, title, user, uid, private)
 
     print('Export complete!', file=sys.stderr, end='\n')
 
