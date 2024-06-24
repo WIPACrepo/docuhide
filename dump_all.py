@@ -1,30 +1,45 @@
-from __future__ import print_function
+from __future__ import print_function, unicode_literals
 
 import argparse
+import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
-from ldap3 import Connection, ALL
-
 
 escape_illegal_xml_characters = lambda x: re.sub(u'[\x00-\x08\x0b\x0c\x0e-\x1F\uD800-\uDFFF\uFFFE\uFFFF]', '', x)
 
+CHMOD_OWNER_FILE = stat.S_IRUSR | stat.S_IWUSR
+CHMOD_OWNER_DIR = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+CHMOD_ALL_FILE = CHMOD_OWNER_FILE | stat.S_IRGRP | stat.S_IROTH
+CHMOD_ALL_DIR = CHMOD_OWNER_FILE | stat.S_IRGRP | stat.S_IROTH | stat.S_IXGRP | stat.S_IXOTH
 
-UID_CACHE = {}
-def get_uid(username):
-    if username in ('root', 'icecube'):
-        return 0
-    if not UID_CACHE:
-        conn = Connection('ldap-1.icecube.wisc.edu', auto_bind=True)
-        entries = conn.extend.standard.paged_search('ou=People,dc=icecube,dc=wisc,dc=edu', '(objectclass=posixAccount)', attributes=['uid', 'uidNumber'], paged_size=100)
-        for entry in entries:
-            attrs = entry['attributes']
-            UID_CACHE[attrs['uid'][0]] = attrs['uidNumber']
 
-    return UID_CACHE[username]
+def sanitize(name):
+    # convert name to valid posix
+    return name.replace('/', '-').replace(';', '-').replace('$', '-')
+
+
+# load username to uid cache
+UID_CACHE = {'root': 0, 'icecube': 0}
+UID_CACHE_PATH = os.path.join(os.path.dirname(__file__), 'username_uid_map.json')
+if os.path.exists(UID_CACHE_PATH):
+    with open(UID_CACHE_PATH) as f:
+        UID_CACHE.update(json.load(f))
+else:
+    print('Loading usernames from LDAP', file=sys.stderr, end='\n')
+    from ldap3 import Connection, ALL
+    conn = Connection('ldap-1.icecube.wisc.edu', auto_bind=True)
+    entries = conn.extend.standard.paged_search('ou=People,dc=icecube,dc=wisc,dc=edu', '(objectclass=posixAccount)', attributes=['uid', 'uidNumber'], paged_size=100)
+    for entry in entries:
+        attrs = entry['attributes']
+        UID_CACHE[attrs['uid'][0]] = attrs['uidNumber']
+    with open(UID_CACHE_PATH, 'w') as f:
+        json.dump(UID_CACHE, f)
 
 
 def get_documents(data):
@@ -50,9 +65,18 @@ def get_documents(data):
             private = True
             acls = child.find('acls')
             for acl in acls:
+                if acl.attrib['principal'] == 'Group-4':
+                    if 'readobject' in acl.attrib['permissions']:
+                        private = False
+                        break
                 if acl.attrib['principal'] == 'Group-5':
                     if 'readobject' in acl.attrib['permissions']:
                         private = False
+                        break
+                if acl.attrib['principal'] == 'Group-7':
+                    if 'readobject' in acl.attrib['permissions']:
+                        private = False
+                        break
             
         if type_ == 'Document':
             props = child.find('props')
@@ -196,7 +220,8 @@ def get_documents(data):
         else:
             print(ET.tostring(child).decode('utf8'))
             raise Exception('new type')
-            
+
+        child.clear()
 
     return documents
 
@@ -298,13 +323,13 @@ def build_tree(documents):
     return tree
 
 
-def walk_tree(tree, id_=None, level=0):
-    if level >= 2:
+def walk_tree(tree, id_=None, level=0, skip_level=None):
+    if skip_level and level >= skip_level:
         return
 
     if id_ is None:
         for r in tree.roots:
-            for ret in walk_tree(tree, r, level=0):
+            for ret in walk_tree(tree, r, level=0, skip_level=skip_level):
                 yield ret
     else:
         yield id_, level
@@ -314,17 +339,32 @@ def walk_tree(tree, id_=None, level=0):
             else:
                 doc = {'type': 'Document'}
             if doc['type'] == 'Collection':
-                for ret in walk_tree(tree, id_=d, level=level+1):
+                for ret in walk_tree(tree, id_=d, level=level+1, skip_level=skip_level):
                     yield ret
             else:
                 yield d, level+1
+
+
+DOCUHIDE_PATH = '/root/docuhide/'
+
+
+def dsexport(arg, metadata=False):
+    cmd = './dsexport.sh -d '+DOCUHIDE_PATH+' '
+    if metadata:
+        cmd += '-r -m '
+    cmd += arg
+    FNULL = open(os.devnull, 'w')
+    subprocess.check_call(cmd, cwd='/root/docushare/bin', shell=True, stdout=FNULL, stderr=subprocess.STDOUT)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_xml', nargs='+', help='use input xml path for testing')
     parser.add_argument('--output', help='output directory (specify to get output)')
+    parser.add_argument('--max-depth', default=None, type=int, help='max depth of output tree')
+    parser.add_argument('--sub-collection', default=None, help='sub-collection to run on')
     args = parser.parse_args()
+
 
     documents = {}
     if args.input_xml:
@@ -334,23 +374,43 @@ def main():
                 documents.update(get_documents(input_xml))
                 del input_xml
     else:
-        path = '/root/docuhide/Collection/Collection.xml'
+        print('Processing Collection metadata', file=sys.stderr, end='\n')
+        path = DOCUHIDE_PATH+'Collection/Collection.xml'
         if not os.path.exists(path):
-            subprocess.check_call('./dsexport.sh -d /root/docuhide -r -m Collection', cwd='/root/docushare/bin', shell=True)
-        with open('/root/docuhide/Collection/Collection.xml', 'r') as f:
+            dsexport('Collection', metadata=True)
+        with open(path, 'r') as f:
             input_xml = escape_illegal_xml_characters(f.read())
-            
-        path = '/root/docuhide/Document/Document.xml'
+        documents.update(get_documents(input_xml))
+        del input_xml
+
+        print('Processing Document metadata', file=sys.stderr, end='\n')
+        path = DOCUHIDE_PATH+'Document/Document.xml'
         if not os.path.exists(path):
-            subprocess.check_call('./dsexport.sh -d /root/docuhide -r -m Document', cwd='/root/docushare/bin', shell=True)
-        with open('/root/docuhide/Document/Document.xml', 'r') as f:
+            dsexport('Document', metadata=True)
+        with open(path, 'r') as f:
             input_xml = escape_illegal_xml_characters(f.read())
+        documents.update(get_documents(input_xml))
+        del input_xml
+
+        print('Processing URL metadata', file=sys.stderr, end='\n')
+        path = DOCUHIDE_PATH+'URL/URL.xml'
+        if not os.path.exists(path):
+            dsexport('URL', metadata=True)
+        with open(path, 'r') as f:
+            input_xml = escape_illegal_xml_characters(f.read())
+        documents.update(get_documents(input_xml))
+        del input_xml
+
+    print('Completed processing metadata. Building tree', file=sys.stderr, end='\n')
 
     tree = build_tree(documents)
 
     # print tree
+    print('Outputting tree and documents', file=sys.stderr, end='\n')
     skip = False
-    for id_, level in walk_tree(tree, id_='Collection-9550'):
+    parent_paths = {}
+    for id_, level in walk_tree(tree, id_=args.sub_collection, skip_level=args.max_depth):
+        # print tree
         if skip and level > 0:
             continue
         try:
@@ -370,22 +430,84 @@ def main():
             continue
         skip = False
         user = documents.get(owner,{}).get('username','root')
-        uid = get_uid(user)
+        uid = UID_CACHE[user]
         print('|'+' '*level + id_, title, user, uid, private)
 
-    return
+        # make posix output
+        if args.output:
+            if level == 0:
+                dir_path = args.output
+            else:
+                dir_path = parent_paths[level-1]
 
-    # get all doc details
-    for id_ in list(documents.keys()):
-        for child_id in tree.nodes[id_]:
-            if child_id not in documents:
-                path = '/root/docuhide/'+child_id+'/'+child_id+'.xml'
-                if not os.path.exists(path):
-                    subprocess.check_call('./dsexport.sh -d /root/docuhide -r -m '+child_id, cwd='/root/docushare/bin', shell=True)
-                with open('/root/docuhide/'+child_id+'/'+child_id+'.xml', 'r') as f:
+            #parent_path = []
+            #parent_id = tree.nodes[id_].parent
+            #while parent_id:
+            #    parent_path.insert(0, sanitize(documents[parent_id]['title']))
+            #    parent_id = tree.nodes[parent_id].parent
+            #dir_path = os.path.join(args.output, *parent_path)
+            #if not os.path.exists(dir_path):
+            #    os.makedirs(dir_path)
+            #parent_paths[level] = dir_path
+
+            if doc['type'] == 'Collection':
+                dest_path = os.path.join(dir_path, sanitize(doc['title']))
+                parent_paths[level] = dest_path
+                if not os.path.exists(dest_path):
+                    os.mkdir(dest_path)
+                if private:
+                    perms = CHMOD_OWNER_DIR
+                else:
+                    perms = CHMOD_ALL_DIR
+            else:
+                # we need to get the actual document
+                path = os.path.join(DOCUHIDE_PATH, id_)
+                dsexport(id_)
+                with open(os.path.join(path, id_+'.xml'), 'r') as f:
                     input_xml = escape_illegal_xml_characters(f.read())
                 documents.update(get_documents(input_xml))
                 del input_xml
+                old_doc = doc
+                doc = documents[id_]
+
+                if doc['type'] == 'URL':
+                    dest_path = os.path.join(dir_path, sanitize(doc['title']))
+                    with open(dest_path, 'w') as f:
+                        print(doc['url'], file=f)
+                elif doc['type'] == 'Document':
+                    src_path = os.path.join(path, 'documents', doc['filename'])
+                    dest_path = os.path.join(dir_path, sanitize(doc['title']))
+                    ext = os.path.splitext(doc['filename'])[-1]
+                    if ext:
+                        dest_path += '.'+ext
+                    try:
+                        shutil.copyfile(src_path, dest_path)
+                    except Exception:
+                        print('old_doc', old_doc, file=sys.stderr)
+                        print('doc', doc, file=sys.stderr)
+                        print('src_path', src_path, file=sys.stderr)
+                        print('dest_path', dest_path, file=sys.stderr)
+                        raise
+                else:
+                    print('id:', id_, file=sys.stderr)
+                    print('old_doc', old_doc, file=sys.stderr)
+                    print('doc', doc, file=sys.stderr)
+                    raise Exception('unknown doc type')
+
+                # clean up
+                shutil.rmtree(path)
+
+                if private:
+                    perms = CHMOD_OWNER_FILE
+                else:
+                    perms = CHMOD_ALL_FILE
+
+            # set ownership and perms
+            os.chown(dest_path, uid, uid)
+            os.chmod(dest_path, perms)
+
+    print('Export complete!', file=sys.stderr, end='\n')
+
 
 if __name__ == '__main__':
     main()
