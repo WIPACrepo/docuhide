@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 
 escape_illegal_xml_characters = lambda x: re.sub(u'[\x00-\x08\x0b\x0c\x0e-\x1F\uD800-\uDFFF\uFFFE\uFFFF]', '', x)
 
+
 CHMOD_OWNER_FILE = stat.S_IRUSR | stat.S_IWUSR
 CHMOD_OWNER_DIR = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
 CHMOD_ALL_FILE = CHMOD_OWNER_FILE | stat.S_IRGRP | stat.S_IROTH
@@ -360,10 +361,14 @@ def walk_tree(tree, id_=None, level=0, skip_level=None):
 DOCUHIDE_PATH = '/root/docuhide/'
 
 
-def dsexport(arg, metadata=False):
+def dsexport(arg, recursive=False, metadata=False, props=None):
     cmd = './dsexport.sh -d '+DOCUHIDE_PATH+' '
+    if recursive:
+        cmd += '-r -t 4 '
     if metadata:
-        cmd += '-r -m '
+        cmd += '-m '
+    if props:
+        cmd += '-p '+','.join(props)+' '
     cmd += arg
     FNULL = open('/root/docuhide/export_err', 'w')
     subprocess.check_call(cmd, cwd='/root/docushare/bin', shell=True, stdout=FNULL, stderr=subprocess.STDOUT)
@@ -383,31 +388,34 @@ def main():
         for path in args.input_xml:
             with open(path, 'r') as f:
                 input_xml = escape_illegal_xml_characters(f.read())
-                documents.update(get_documents(input_xml))
+                documents.update(get_documents(input_xml, details=True))
                 del input_xml
     else:
-        print('Processing Collection metadata', file=sys.stderr, end='\n')
         path = DOCUHIDE_PATH+'Collection/Collection.xml'
         if not os.path.exists(path):
-            dsexport('Collection', metadata=True)
+            print('Running dsexport for Collection metadata', file=sys.stderr, end='\n')
+            dsexport('Collection', metadata=True, props=['title', 'create_date', 'sort_order'])
+        print('Processing Collection metadata', file=sys.stderr, end='\n')
         with open(path, 'r') as f:
             input_xml = escape_illegal_xml_characters(f.read())
         documents.update(get_documents(input_xml))
         del input_xml
 
-        print('Processing Document metadata', file=sys.stderr, end='\n')
         path = DOCUHIDE_PATH+'Document/Document.xml'
         if not os.path.exists(path):
-            dsexport('Document', metadata=True)
+            print('Running dsexport for Document metadata', file=sys.stderr, end='\n')
+            dsexport('Document', metadata=True, props=['noprops'])
+        print('Processing Document metadata', file=sys.stderr, end='\n')
         with open(path, 'r') as f:
             input_xml = escape_illegal_xml_characters(f.read())
         documents.update(get_documents(input_xml))
         del input_xml
 
-        print('Processing URL metadata', file=sys.stderr, end='\n')
         path = DOCUHIDE_PATH+'URL/URL.xml'
         if not os.path.exists(path):
-            dsexport('URL', metadata=True)
+            print('Running dsexport for URL metadata', file=sys.stderr, end='\n')
+            dsexport('URL', metadata=True, props=['noprops'])
+        print('Processing URL metadata', file=sys.stderr, end='\n')
         with open(path, 'r') as f:
             input_xml = escape_illegal_xml_characters(f.read())
         documents.update(get_documents(input_xml))
