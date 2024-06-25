@@ -230,6 +230,9 @@ def get_documents(data, details=False):
         elif type_ == 'Group':
             continue
 
+        elif type_ == 'BulletinBoard':
+            continue
+
         else:
             print(ET.tostring(child).decode('utf8'))
             raise Exception('new type')
@@ -506,6 +509,8 @@ def main():
                         print('src_path', src_path, file=sys.stderr)
                         print('dest_path', dest_path, file=sys.stderr)
                         raise
+                elif doc['type'] == 'BulletinBoard':
+                    continue
                 else:
                     print('id:', id_, file=sys.stderr)
                     print('old_doc', old_doc, file=sys.stderr)
