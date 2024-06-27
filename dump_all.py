@@ -2,6 +2,8 @@ from __future__ import print_function, unicode_literals, division
 
 import argparse
 from datetime import datetime
+from itertools import islice
+import io
 import json
 import os
 import re
@@ -49,9 +51,12 @@ def total_seconds(timedelta):
     return int(timedelta.seconds + timedelta.days * 24 * 3600)
 
 
+IGNORE_DOC_TYPES = ('Group', 'BulletinBoard', 'Bulletin', 'Weblog', 'WeblogEntry', 'Event', 'Calendar')
+
+
 def get_documents(data, details=False):
     """Parse Docushare XML"""
-    root = ET.fromstring(data)
+    root = ET.fromstring(data.encode('utf-8'))
 
     collections = {}
     documents = {}
@@ -89,16 +94,17 @@ def get_documents(data, details=False):
             if not details:
                 documents[id_] = {
                     'type': 'Document',
-                    'owner': owner,
                 }
             else:
                 props = child.find('props')
                 title = id_
+                original_file_name = None
                 if props is not None and len(props) > 0:
                     for prop in props:
                         if prop.attrib['name'] == 'title':
                             title = prop.text
-                            break
+                        if prop.attrib['name'] == 'original_file_name':
+                            original_file_name = prop.text
 
                 versions = child.find('versions')
                 if versions is None:
@@ -152,10 +158,11 @@ def get_documents(data, details=False):
                 documents[id_] = {
                     'type': 'Document',
                     'owner': owner,
-                    'title': title,
+                    'title': title.strip(),
                     'private': private,
                     'size': size,
                     'filename': filename,
+                    'original_file_name': original_file_name.strip(),
                     'date': date,
                 }
 
@@ -177,7 +184,7 @@ def get_documents(data, details=False):
 
             documents[id_] = {
                 'type': 'Collection',
-                'title': title,
+                'title': title.strip(),
                 'sort_order': sort_order,
                 'date': date,
                 'owner': owner,
@@ -186,28 +193,33 @@ def get_documents(data, details=False):
             }
 
         elif type_ == 'URL':
-            title = ''
-            url = ''
-            props = child.find('props')
-            if props is None or len(props) == 0:
-                title = id_
+            if not details:
+                documents[id_] = {
+                    'type': 'URL',
+                }
             else:
-                for prop in props:
-                    if prop.attrib['name'] == 'title':
-                        title = prop.text
-                    if prop.attrib['name'] == 'url':
-                        url = prop.text
+                title = ''
+                url = ''
+                props = child.find('props')
+                if props is None or len(props) == 0:
+                    title = id_
+                else:
+                    for prop in props:
+                        if prop.attrib['name'] == 'title':
+                            title = prop.text
+                        if prop.attrib['name'] == 'url':
+                            url = prop.text
 
-            if not url:
-                continue
+                if not url:
+                    continue
 
-            documents[id_] = {
-                'type': 'URL',
-                'title': title,
-                'url': url,
-                'owner': owner,
-                'private': private,
-            }
+                documents[id_] = {
+                    'type': 'URL',
+                    'title': title.strip(),
+                    'url': url,
+                    'owner': owner,
+                    'private': private,
+                }
 
         elif type_ == 'User':
             props = child.find('props')
@@ -227,11 +239,10 @@ def get_documents(data, details=False):
                 'username': username,
             }
 
-        elif type_ == 'Group':
-            continue
-
-        elif type_ == 'BulletinBoard':
-            continue
+        elif type_ in IGNORE_DOC_TYPES:
+            documents[id_] = {
+                'type': type_,
+            }
 
         else:
             print(ET.tostring(child).decode('utf8'))
@@ -367,7 +378,7 @@ DOCUHIDE_PATH = '/root/docuhide/'
 def dsexport(arg, recursive=False, metadata=False, props=None):
     cmd = './dsexport.sh -d '+DOCUHIDE_PATH+' '
     if recursive:
-        cmd += '-r -t 4 '
+        cmd += '-r -t 8 '
     if metadata:
         cmd += '-m '
     if props:
@@ -381,15 +392,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_xml', nargs='+', help='use input xml path for testing')
     parser.add_argument('--output', help='output directory (specify to get output)')
+    parser.add_argument('--output-mapping', default='/dev/null', help='output mapping file (id,path)')
+    parser.add_argument('--parallel', default=1, type=int, help='parallel document lookup for output')
     parser.add_argument('--max-depth', default=None, type=int, help='max depth of output tree')
     parser.add_argument('--sub-collection', default=None, help='sub-collection to run on')
     args = parser.parse_args()
 
-
     documents = {}
     if args.input_xml:
         for path in args.input_xml:
-            with open(path, 'r') as f:
+            with io.open(path, 'r', encoding='utf-8') as f:
                 input_xml = escape_illegal_xml_characters(f.read())
                 documents.update(get_documents(input_xml, details=True))
                 del input_xml
@@ -399,7 +411,7 @@ def main():
             print('Running dsexport for Collection metadata', file=sys.stderr, end='\n')
             dsexport('Collection', metadata=True, props=['title', 'create_date', 'sort_order'])
         print('Processing Collection metadata', file=sys.stderr, end='\n')
-        with open(path, 'r') as f:
+        with io.open(path, 'r', encoding='utf-8') as f:
             input_xml = escape_illegal_xml_characters(f.read())
         documents.update(get_documents(input_xml))
         del input_xml
@@ -409,17 +421,17 @@ def main():
             print('Running dsexport for Document metadata', file=sys.stderr, end='\n')
             dsexport('Document', metadata=True, props=['noprops'])
         print('Processing Document metadata', file=sys.stderr, end='\n')
-        with open(path, 'r') as f:
+        with io.open(path, 'r', encoding='utf-8') as f:
             input_xml = escape_illegal_xml_characters(f.read())
         documents.update(get_documents(input_xml))
         del input_xml
 
         path = DOCUHIDE_PATH+'URL/URL.xml'
-        if not os.path.exists(path):
+        if not io.os.path.exists(path):
             print('Running dsexport for URL metadata', file=sys.stderr, end='\n')
             dsexport('URL', metadata=True, props=['noprops'])
         print('Processing URL metadata', file=sys.stderr, end='\n')
-        with open(path, 'r') as f:
+        with io.open(path, 'r', encoding='utf-8') as f:
             input_xml = escape_illegal_xml_characters(f.read())
         documents.update(get_documents(input_xml))
         del input_xml
@@ -430,92 +442,115 @@ def main():
 
     # print tree
     print('Outputting tree and documents', file=sys.stderr, end='\n')
-    parent_paths = {}
-    for id_, level in walk_tree(tree, id_=args.sub_collection, skip_level=args.max_depth):
-        # print tree
-        try:
-            doc = documents[id_]
-        except KeyError:
-            doc = {'type': 'Document', 'title': '', 'owner': '', 'private': False}
 
-        if doc['type'] == 'Collection':
-            title = doc['title']
-            owner = doc['owner']
-            private = doc['private']
-        else:
-            owner = doc['owner']
-        user = documents.get(owner,{}).get('username','root')
-        uid = UID_CACHE[user]
+    def parallel(iter_, n=args.parallel):
+        batch = tuple(islice(iter_, n))
+        while batch:
+            doc_ids = []
+            for id_, level in batch:
+                try:
+                    doc = documents[id_]
+                except KeyError:
+                    doc = {'type': 'Document', 'title': '', 'owner': 'root', 'private': False}
 
-        # make posix output
-        if args.output:
-            if level == 0:
-                dir_path = args.output
-            else:
-                dir_path = parent_paths[level-1]
-
-            #parent_path = []
-            #parent_id = tree.nodes[id_].parent
-            #while parent_id:
-            #    parent_path.insert(0, sanitize(documents[parent_id]['title']))
-            #    parent_id = tree.nodes[parent_id].parent
-            #dir_path = os.path.join(args.output, *parent_path)
-            #if not os.path.exists(dir_path):
-            #    os.makedirs(dir_path)
-            #parent_paths[level] = dir_path
-
-            if doc['type'] == 'Collection':
-                dest_path = os.path.join(dir_path, sanitize(doc['title']))
-                parent_paths[level] = dest_path
-                if not os.path.exists(dest_path):
-                    os.mkdir(dest_path)
-                if private:
-                    perms = CHMOD_OWNER_DIR
-                else:
-                    perms = CHMOD_ALL_DIR
-                if doc.get('date', None) is not None:
-                    try:
-                        os.utime(dest_path, (doc['date'], doc['date']))
-                    except Exception:
-                        print('cannot set time on', dest_path, file=sys.stderr)
-            else:
-                # we need to get the actual document
-                path = os.path.join(DOCUHIDE_PATH, id_)
-                dsexport(id_)
-                with open(os.path.join(path, id_+'.xml'), 'r') as f:
-                    input_xml = escape_illegal_xml_characters(f.read())
-                old_doc = doc
-                new_docs = get_documents(input_xml, details=True)
-                doc = new_docs[id_]
-                del input_xml
-                title = doc['title']
-                private = doc['private']
-
-                if doc['type'] == 'URL':
-                    dest_path = os.path.join(dir_path, sanitize(doc['title']))
-                    with open(dest_path, 'w') as f:
-                        print(doc['url'], file=f)
-                elif doc['type'] == 'Document':
-                    src_path = os.path.join(path, 'documents', doc['filename'])
-                    dest_path = os.path.join(dir_path, sanitize(doc['title']))
-                    ext = os.path.splitext(doc['filename'])[-1]
-                    if ext:
-                        dest_path += '.'+ext
-                    try:
-                        shutil.copyfile(src_path, dest_path)
-                    except Exception:
-                        print('old_doc', old_doc, file=sys.stderr)
-                        print('doc', doc, file=sys.stderr)
-                        print('src_path', src_path, file=sys.stderr)
-                        print('dest_path', dest_path, file=sys.stderr)
-                        raise
-                elif doc['type'] == 'BulletinBoard':
+                if doc['type'] in IGNORE_DOC_TYPES:
                     continue
+                if doc['type'] != 'Collection' and args.output:
+                    doc_ids.append(id_)
+
+            if doc_ids:
+                # we need to get the actual document
+                id_ = doc_ids[0]
+                path = os.path.join(DOCUHIDE_PATH, id_)
+                dsexport(' '.join(doc_ids), recursive=True)
+                with io.open(os.path.join(path, id_+'.xml'), 'r', encoding='utf-8') as f:
+                    input_xml = escape_illegal_xml_characters(f.read())
+                new_docs = get_documents(input_xml, details=True)
+                del input_xml
+
+            try:
+                for id_, level in batch:
+                    try:
+                        doc = documents[id_]
+                    except KeyError:
+                        doc = {'type': 'Document', 'title': '', 'owner': 'root', 'private': False}
+
+                    base_path = None
+                    if doc['type'] in IGNORE_DOC_TYPES:
+                        continue
+                    if doc['type'] != 'Collection' and args.output:
+                        doc = new_docs[id_]
+                        base_path = path
+
+                    yield (id_, level, doc, base_path)
+            finally:
+                if doc_ids:
+                    # clean up
+                    shutil.rmtree(path)
+            batch = tuple(islice(iter_, n))
+
+    with io.open(args.output_mapping, 'w', 1) as mapping_file:
+        parent_paths = {}
+        tree_iter = walk_tree(tree, id_=args.sub_collection, skip_level=args.max_depth)
+        for id_, level, doc, base_path in parallel(tree_iter):
+            if doc['type'] in IGNORE_DOC_TYPES:
+                continue
+
+            # print tree
+            title = doc['title']
+            private = doc['private']
+            owner = doc['owner']
+            user = documents.get(owner,{}).get('username','root')
+            uid = UID_CACHE.get(user, 0)
+            print('|'+' '*level + id_, title, user, uid, private)
+
+            # make posix output
+            if args.output:
+                if level == 0:
+                    dir_path = args.output
                 else:
-                    print('id:', id_, file=sys.stderr)
-                    print('old_doc', old_doc, file=sys.stderr)
-                    print('doc', doc, file=sys.stderr)
-                    raise Exception('unknown doc type')
+                    dir_path = parent_paths[level-1]
+
+                if doc['type'] == 'Collection':
+                    dest_path = os.path.join(dir_path, sanitize(doc['title']))
+                    parent_paths[level] = dest_path
+                    if not os.path.exists(dest_path):
+                        os.mkdir(dest_path)
+                    if private:
+                        perms = CHMOD_OWNER_DIR
+                    else:
+                        perms = CHMOD_ALL_DIR
+                else:
+                    if doc['type'] == 'URL':
+                        dest_path = os.path.join(dir_path, sanitize(doc['title']))+'.txt'
+                        with open(dest_path, 'w') as f:
+                            print(doc['url'], file=f)
+                    elif doc['type'] == 'Document':
+                        src_path = os.path.join(base_path, 'documents', doc['filename'])
+                        dest_path = os.path.join(dir_path, sanitize(doc['title']))
+                        dest_ext = os.path.splitext(dest_path)[-1]
+                        if (not dest_ext) or (len(dest_ext) > 5):
+                            ext = os.path.splitext(doc['original_file_name'])[-1]
+                            if not ext:
+                                ext = os.path.splitext(doc['filename'])[-1]
+                            if ext:
+                                dest_path += ext
+                        try:
+                            shutil.copyfile(src_path, dest_path)
+                        except Exception:
+                            print('doc', doc, file=sys.stderr)
+                            print('src_path', src_path, file=sys.stderr)
+                            print('dest_path', dest_path, file=sys.stderr)
+                            raise
+                    else:
+                        print('id:', id_, file=sys.stderr)
+                        print('doc', doc, file=sys.stderr)
+                        raise Exception('unknown doc type')
+
+                    if private:
+                        perms = CHMOD_OWNER_FILE
+                    else:
+                        perms = CHMOD_ALL_FILE
 
                 if doc.get('date', None) is not None:
                     try:
@@ -523,20 +558,12 @@ def main():
                     except Exception:
                         print('cannot set time on', dest_path, file=sys.stderr)
 
-                # clean up
-                shutil.rmtree(path)
+                # set ownership and perms
+                os.chown(dest_path, uid, uid)
+                os.chmod(dest_path, perms)
 
-                if private:
-                    perms = CHMOD_OWNER_FILE
-                else:
-                    perms = CHMOD_ALL_FILE
-
-            # set ownership and perms
-            os.chown(dest_path, uid, uid)
-            os.chmod(dest_path, perms)
-
-        # do this after output, to get a better doc title
-        print('|'+' '*level + id_, title, user, uid, private)
+                # output mapping
+                mapping_file.write(id_ + ',' + dest_path + '\n')
 
     print('Export complete!', file=sys.stderr, end='\n')
 
