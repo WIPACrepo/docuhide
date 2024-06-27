@@ -491,10 +491,18 @@ def main():
 
     with io.open(args.output_mapping, 'w', 1) as mapping_file:
         parent_paths = {}
+        parent_collections = []
         tree_iter = walk_tree(tree, id_=args.sub_collection, skip_level=args.max_depth)
         for id_, level, doc, base_path in parallel(tree_iter):
             if doc['type'] in IGNORE_DOC_TYPES:
                 continue
+            if doc['type'] == 'Collection':
+                if len(parent_collections) >= level:
+                    parent_collections = parent_collections[:level]
+                if id_ in parent_collections:
+                    # anti-loop code
+                    continue
+                parent_collections.append(id_)
 
             # print tree
             title = doc['title']
