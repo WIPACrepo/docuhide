@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 
 
@@ -51,7 +52,7 @@ def total_seconds(timedelta):
     return int(timedelta.seconds + timedelta.days * 24 * 3600)
 
 
-IGNORE_DOC_TYPES = ('Group', 'BulletinBoard', 'Bulletin', 'Weblog', 'WeblogEntry', 'Event', 'Calendar')
+IGNORE_DOC_TYPES = ('Group', 'BulletinBoard', 'Bulletin', 'Weblog', 'WeblogEntry', 'Event', 'Calendar', 'Wiki', 'WikiPage')
 
 
 def get_documents(data, details=False):
@@ -102,9 +103,9 @@ def get_documents(data, details=False):
                 if props is not None and len(props) > 0:
                     for prop in props:
                         if prop.attrib['name'] == 'title':
-                            title = prop.text
+                            title = prop.text.strip()
                         if prop.attrib['name'] == 'original_file_name':
-                            original_file_name = prop.text
+                            original_file_name = prop.text.strip()
 
                 versions = child.find('versions')
                 if versions is None:
@@ -146,7 +147,7 @@ def get_documents(data, details=False):
                     for o in r.findall('./contentelements/contentelement'):
                         filename = o.attrib['filename']
                         if title == id_:
-                            title = o.text
+                            title = o.text.strip()
                         break
                     else:
                         filename = None
@@ -158,11 +159,11 @@ def get_documents(data, details=False):
                 documents[id_] = {
                     'type': 'Document',
                     'owner': owner,
-                    'title': title.strip(),
+                    'title': title,
                     'private': private,
                     'size': size,
                     'filename': filename,
-                    'original_file_name': original_file_name.strip(),
+                    'original_file_name': original_file_name,
                     'date': date,
                 }
 
@@ -176,15 +177,15 @@ def get_documents(data, details=False):
             else:
                 for prop in props:
                     if prop.attrib['name'] == 'title':
-                        title = prop.text
+                        title = prop.text.strip()
                     if prop.attrib['name'] == 'sort_order':
-                        sort_order = prop.text
+                        sort_order = prop.text.strip()
                     if prop.attrib['name'] == 'create_date':
                         date = total_seconds(datetime.strptime(prop.text, '%a %b %d %H:%M:%S %Z %Y') - datetime.fromtimestamp(0))
 
             documents[id_] = {
                 'type': 'Collection',
-                'title': title.strip(),
+                'title': title,
                 'sort_order': sort_order,
                 'date': date,
                 'owner': owner,
@@ -206,16 +207,16 @@ def get_documents(data, details=False):
                 else:
                     for prop in props:
                         if prop.attrib['name'] == 'title':
-                            title = prop.text
+                            title = prop.text.strip()
                         if prop.attrib['name'] == 'url':
-                            url = prop.text
+                            url = prop.text.strip()
 
                 if not url:
                     continue
 
                 documents[id_] = {
                     'type': 'URL',
-                    'title': title.strip(),
+                    'title': title,
                     'url': url,
                     'owner': owner,
                     'private': private,
@@ -229,7 +230,7 @@ def get_documents(data, details=False):
             username = None
             for prop in props:
                 if prop.attrib['name'] == 'username':
-                    username = prop.text
+                    username = prop.text.strip()
                     break
             else:
                 raise Exception('no username in user')
@@ -350,26 +351,73 @@ def build_tree(documents):
     return tree
 
 
-def walk_tree(tree, id_=None, level=0, skip_level=None):
-    if skip_level and level >= skip_level:
-        return
+class TreeWalker:
+    def __init__(self, tree, skip_level=None, traversal_type='dfs'):
+        self.tree = tree
+        self.skip_level = skip_level
+        self.traversal_type = traversal_type
+        self.seen = set()
 
-    if id_ is None:
-        for r in tree.roots:
-            for ret in walk_tree(tree, r, level=0, skip_level=skip_level):
-                yield ret
-    else:
-        yield id_, level
-        for d in tree.nodes[id_]:
-            if d in tree.documents:
-                doc = tree.documents[d]
+    def _traverse_dfs(self, id_, parents):
+        level = len(parents)
+        if self.skip_level and level >= self.skip_level:
+            return
+
+        self.seen.add(id_)
+        yield id_, parents
+        new_parents = parents + [id_]
+        for d in self.tree.nodes[id_]:
+            if d in self.tree.documents:
+                doc = self.tree.documents[d]
             else:
                 doc = {'type': 'Document'}
             if doc['type'] == 'Collection':
-                for ret in walk_tree(tree, id_=d, level=level+1, skip_level=skip_level):
+                if d in new_parents or d in self.seen:
+                    # anti-loop code
+                    continue
+                for ret in self._traverse_helper(d, new_parents):
                     yield ret
             else:
-                yield d, level+1
+                yield d, new_parents
+
+    def traverse(self, id_=None):
+        ids = [id_] if id_ else self.tree.roots
+        
+        if self.traversal_type == 'dfs':
+            for id_ in ids:
+                for ret in self._traverse_dfs(id_, []):
+                    yield ret
+        else: # bfs
+            for id_ in ids:
+                yield id_, []
+
+            queue = [(id_, []) for id_ in ids]
+            while queue:
+                id_, parents = queue[0]
+                queue = queue[1:]
+                self.seen.add(id_)
+                parents.append(id_)
+                for d in self.tree.nodes[id_]:
+                    if d in self.tree.documents:
+                        doc = self.tree.documents[d]
+                    else:
+                        doc = {'type': 'Document'}
+                    if doc['type'] == 'Collection':
+                        if d in parents or d in self.seen:
+                            # anti-loop code
+                            continue
+                        queue.append((d, list(parents)))
+                    yield d, parents
+
+
+def progress(total, iterator):
+    last = time.time()
+    for num, ret in enumerate(iterator):
+        now = time.time()
+        if now - last > 60:
+            print(num/total)
+            last = now
+        yield ret
 
 
 DOCUHIDE_PATH = '/root/docuhide/'
@@ -447,7 +495,7 @@ def main():
         batch = tuple(islice(iter_, n))
         while batch:
             doc_ids = []
-            for id_, level in batch:
+            for id_, parents in batch:
                 try:
                     doc = documents[id_]
                 except KeyError:
@@ -469,7 +517,7 @@ def main():
                 del input_xml
 
             try:
-                for id_, level in batch:
+                for id_, parents in batch:
                     try:
                         doc = documents[id_]
                     except KeyError:
@@ -482,27 +530,20 @@ def main():
                         doc = new_docs[id_]
                         base_path = path
 
-                    yield (id_, level, doc, base_path)
+                    yield (id_, parents, doc, base_path)
             finally:
                 if doc_ids:
                     # clean up
                     shutil.rmtree(path)
             batch = tuple(islice(iter_, n))
 
+    wt = TreeWalker(tree, skip_level=args.max_depth, traversal_type='bfs')
+    tree_iter = wt.traverse(id_=args.sub_collection)
     with io.open(args.output_mapping, 'w', 1) as mapping_file:
-        parent_paths = {}
-        parent_collections = []
-        tree_iter = walk_tree(tree, id_=args.sub_collection, skip_level=args.max_depth)
-        for id_, level, doc, base_path in parallel(tree_iter):
+        for id_, parents, doc, base_path in progress(len(tree.nodes), parallel(tree_iter)):
+            level = len(parents)
             if doc['type'] in IGNORE_DOC_TYPES:
                 continue
-            if doc['type'] == 'Collection':
-                if len(parent_collections) >= level:
-                    parent_collections = parent_collections[:level]
-                if id_ in parent_collections:
-                    # anti-loop code
-                    continue
-                parent_collections.append(id_)
 
             # print tree
             title = doc['title']
@@ -510,18 +551,17 @@ def main():
             owner = doc['owner']
             user = documents.get(owner,{}).get('username','root')
             uid = UID_CACHE.get(user, 0)
-            print('|'+' '*level + id_, title, user, uid, private)
+            print('|'+'-'*level + id_, user, private)#, title, user, uid, private)
 
             # make posix output
             if args.output:
                 if level == 0:
                     dir_path = args.output
                 else:
-                    dir_path = parent_paths[level-1]
+                    dir_path = os.path.join(args.output, *[sanitize(documents[d]['title']) for d in parents])
 
                 if doc['type'] == 'Collection':
                     dest_path = os.path.join(dir_path, sanitize(doc['title']))
-                    parent_paths[level] = dest_path
                     if not os.path.exists(dest_path):
                         os.mkdir(dest_path)
                     if private:
